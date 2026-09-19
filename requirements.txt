@@ -1,0 +1,5 @@
+# Runtime dependencies for the ingestion package.
+# Stage 3's Airflow image installs this same file, so the DAG and the
+# standalone CLI can never drift onto different library versions.
+requests>=2.32,<3
+psycopg2-binary>=2.9,<3

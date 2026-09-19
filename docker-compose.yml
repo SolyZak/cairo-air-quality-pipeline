@@ -1,0 +1,77 @@
+# ---------------------------------------------------------------------------
+# Stage 1: Postgres only.
+# Airflow services are added in stage 3, dbt runs inside the Airflow image.
+#
+#   docker compose up -d
+#
+# The `version:` key is deliberately absent -- it has been obsolete since
+# Compose v2 and current versions warn about it.
+# ---------------------------------------------------------------------------
+
+# Pin the Compose project name. Without this it defaults to the directory name,
+# so renaming or moving the checkout would orphan the pgdata volume.
+name: cairo-air-quality
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: aq_postgres
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB come from .env and are
+      # read by the official image's entrypoint. AIRFLOW_DB is ours -- it is
+      # consumed by sql/00_create_airflow_db.sh below.
+      AIRFLOW_DB: ${AIRFLOW_DB}
+      # Deterministic collation so ORDER BY on text is stable across machines.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    ports:
+      # Published so you can connect with psql / DBeaver from the host.
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Anything in this directory is executed, in filename order, the FIRST
+      # time the data volume is initialised -- and only then. Re-applying DDL
+      # to a running database is what scripts/apply_ddl.sh is for.
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Airflow's services will wait on this in stage 3.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # Standalone ingestion runner. `profiles:` keeps it OUT of `docker compose up`
+  # -- it is a one-shot command, not a long-running service, so starting it
+  # alongside Postgres would just produce an exited container every boot.
+  # `docker compose run` enables a service's profile automatically:
+  #
+  #   docker compose run --rm ingest --days 7
+  #   docker compose run --rm ingest --start 2026-08-01 --end 2026-08-31
+  #   docker compose run --rm ingest --dry-run
+  #
+  # In stage 3 Airflow calls the same code by importing it, not by running this
+  # container -- this service stays as the manual/debug entry point.
+  ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cairo-air-quality/ingest:local
+    profiles: ["tools"]
+    env_file: .env
+    environment:
+      # Inside the compose network the database is reachable by service name,
+      # whatever POSTGRES_HOST says in .env for host-side use.
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      # Bind-mounted so editing the package takes effect on the next run
+      # without rebuilding the image.
+      - ./ingestion:/opt/pipeline/ingestion:ro
+
+volumes:
+  pgdata:

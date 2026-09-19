@@ -11,6 +11,17 @@ the result. Orchestrated by Airflow. Everything runs locally with one command.
 **Stack:** Python 3.12 · Postgres 16 · Apache Airflow 3.3 (LocalExecutor) ·
 dbt-postgres 1.11 · Docker Compose · GitHub Actions
 
+![The DAG in Airflow](docs/img/airflow-grid.png)
+
+*`check_warehouse_ready → ingest → dbt_run → dbt_test`, running daily at 03:00
+UTC. The run history covers all three trigger types — scheduled, manual and
+backfill.*
+
+![dbt lineage](docs/img/dbt-lineage.png)
+
+*Lineage from the two source tables through the staging view into the star
+schema, and on to the two singular data tests.*
+
 ---
 
 ## Architecture

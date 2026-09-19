@@ -1,0 +1,20 @@
+# Connection profile. Lives in the project directory rather than ~/.dbt so the
+# repo is self-contained; DBT_PROFILES_DIR points here.
+#
+# Every value comes from the environment -- there are no credentials in this
+# file, which is what lets it be committed.
+cairo_air_quality:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('POSTGRES_HOST', 'postgres') }}"
+      port: "{{ env_var('POSTGRES_PORT', '5432') | int }}"
+      user: "{{ env_var('POSTGRES_USER') }}"
+      password: "{{ env_var('POSTGRES_PASSWORD') }}"
+      dbname: "{{ env_var('POSTGRES_DB') }}"
+      schema: analytics
+      # Four models, no long-running ones -- more threads would not help.
+      threads: 4
+      # Fail rather than hang if the database is unreachable.
+      connect_timeout: 10

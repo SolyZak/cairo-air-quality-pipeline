@@ -1,0 +1,24 @@
+version: 2
+
+models:
+  - name: stg_hourly_readings
+    description: >
+      staging.hourly_readings with Cairo local time derived and columns given
+      warehouse names. One row per location, pollutant and hour.
+    columns:
+      - name: measured_at_utc
+        description: Hour of measurement, UTC. Half of the natural key.
+        tests: [not_null]
+      - name: measured_at_cairo
+        description: The same instant as Cairo wall-clock time. Derived, never stored.
+        tests: [not_null]
+      - name: pollutant_code
+        tests:
+          - not_null
+          - relationships:
+              to: source('staging', 'pollutants')
+              field: pollutant_code
+      - name: concentration
+        description: >
+          Nullable on purpose -- NULL means the API had no data for that hour.
+          The row is kept so the gap stays countable.

@@ -1,0 +1,99 @@
+version: 2
+
+models:
+  - name: dim_date
+    description: >
+      Calendar dimension, one row per CAIRO calendar day, spanning exactly the
+      range present in the readings.
+    columns:
+      - name: date_key
+        description: YYYYMMDD as an integer. Primary key.
+        tests: [not_null, unique]
+      - name: date_day
+        tests: [not_null, unique]
+      - name: is_weekend
+        description: Friday/Saturday in Egypt, not Saturday/Sunday.
+        tests: [not_null]
+      - name: day_of_week
+        description: ISO weekday, Monday = 1.
+        tests:
+          - not_null
+          - accepted_values:
+              values: [1, 2, 3, 4, 5, 6, 7]
+              quote: false
+
+  - name: dim_pollutant
+    description: Pollutant reference dimension. Four rows, keyed on the Open-Meteo variable name.
+    columns:
+      - name: pollutant_key
+        tests: [not_null, unique]
+      - name: display_name
+        tests: [not_null]
+      - name: unit
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['ug/m3']
+      - name: plausible_max
+        tests: [not_null]
+
+  - name: fct_hourly_readings
+    description: >
+      One row per location, pollutant and hour. Incremental on the loader's
+      loaded_at watermark, so revised values are picked up but unchanged rows
+      are never reprocessed.
+    columns:
+      - name: reading_key
+        description: md5 of the natural key. Exists so a single-column unique test can police a three-column grain.
+        tests: [not_null, unique]
+
+      - name: date_key
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_date')
+              field: date_key
+
+      - name: pollutant_key
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_pollutant')
+              field: pollutant_key
+
+      - name: location_code
+        tests: [not_null]
+
+      - name: measured_at_utc
+        tests: [not_null]
+
+      - name: measured_at_cairo
+        tests: [not_null]
+
+      - name: hour_of_day_cairo
+        tests:
+          - not_null
+          - accepted_range:
+              min_value: 0
+              max_value: 23
+
+      - name: concentration
+        description: >
+          Nullable: NULL means the API reported no data for that hour.
+          The upper bound here is a coarse "no pollutant on earth reads this"
+          check; per-pollutant bounds are enforced by
+          assert_concentration_within_pollutant_bounds.sql.
+        tests:
+          - accepted_range:
+              min_value: 0
+              max_value: 10000
+
+      - name: unit
+        tests: [not_null]
+
+      - name: source_response_id
+        tests: [not_null]
+
+      - name: source_loaded_at
+        description: The loader's watermark. Drives the incremental filter.
+        tests: [not_null]

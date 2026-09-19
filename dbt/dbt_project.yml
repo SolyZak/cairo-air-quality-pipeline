@@ -1,0 +1,23 @@
+name: cairo_air_quality
+version: "1.0.0"
+config-version: 2
+
+profile: cairo_air_quality
+
+model-paths: ["models"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+# Everything dbt builds lands in the `analytics` schema (set in profiles.yml).
+# dbt's default behaviour is to APPEND a custom schema to the target one, so
+# `+schema: marts` would produce `analytics_marts`. Keeping one schema and
+# leaning on the stg_/dim_/fct_ prefixes is simpler to read, and it means the
+# KPI queries in a dashboard only ever reference `analytics.*`.
+models:
+  cairo_air_quality:
+    staging:
+      # Views: a thin renaming layer over the loader's output. Materialising it
+      # would be a second copy of the same rows with no query saved.
+      +materialized: view
+    marts:
+      +materialized: table

@@ -25,6 +25,7 @@ import logging
 from datetime import timedelta
 
 import pendulum
+from airflow.providers.standard.operators.bash import BashOperator
 from airflow.sdk import dag, get_current_context, task
 
 from ingestion.config import Settings
@@ -52,6 +53,17 @@ DEFAULT_ARGS = {
     "retry_delay": timedelta(minutes=2),
     "retry_exponential_backoff": True,
     "max_retry_delay": timedelta(minutes=30),
+}
+
+# dbt runs from its own virtualenv -- see airflow.Dockerfile for why it is not
+# installed alongside Airflow. The project directory is mounted read-only, so
+# dbt's target/ and logs/ go to /tmp; nothing in them is worth keeping.
+DBT_BIN = "/opt/dbt-venv/bin/dbt"
+DBT_DIR = "/opt/airflow/dbt"
+DBT_ENV = {
+    "DBT_PROFILES_DIR": DBT_DIR,
+    "DBT_TARGET_PATH": "/tmp/dbt-target",
+    "DBT_LOG_PATH": "/tmp/dbt-logs",
 }
 
 
@@ -144,9 +156,37 @@ def cairo_air_quality_daily():
         # Small scalars only -- this is a summary for the UI, never the data.
         return summary._asdict()
 
-    # Stage 4 appends the dbt tasks here:
-    #     check_warehouse_ready() >> ingest() >> dbt_run >> dbt_test
-    check_warehouse_ready() >> ingest()
+    # `dbt run` and `dbt test` are separate tasks rather than a single
+    # `dbt build`. build interleaves them, which is better at stopping bad data
+    # reaching downstream models -- but with four models and no downstream
+    # consumers, the clearer signal wins: the Airflow graph then distinguishes
+    # "the models would not build" from "the models built and the data is
+    # wrong", which are different pages of the runbook.
+    #
+    # append_env keeps the container's POSTGRES_* variables, which profiles.yml
+    # reads; without it, env= would replace the environment wholesale.
+    #
+    # retries=1, not the DAG default of 4. A failing dbt test is deterministic
+    # -- the same bad row fails the same way four times over half an hour, and
+    # all that buys is a later alert. The single retry covers a genuinely
+    # transient case, like the database restarting mid-run.
+    dbt_run = BashOperator(
+        task_id="dbt_run",
+        bash_command=f"{DBT_BIN} run --project-dir {DBT_DIR}",
+        env=DBT_ENV,
+        append_env=True,
+        retries=1,
+    )
+
+    dbt_test = BashOperator(
+        task_id="dbt_test",
+        bash_command=f"{DBT_BIN} test --project-dir {DBT_DIR}",
+        env=DBT_ENV,
+        append_env=True,
+        retries=1,
+    )
+
+    check_warehouse_ready() >> ingest() >> dbt_run >> dbt_test
 
 
 cairo_air_quality_daily()

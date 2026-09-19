@@ -2,8 +2,8 @@
 
 Daily pipeline: Open-Meteo Air Quality API -> Postgres -> dbt star schema, orchestrated by Airflow, all in Docker Compose.
 
-> **Build status: stage 3 of 5.** Postgres, the ingestion CLI and Airflow
-> are in place. Stages 4-5 (dbt, CI + full README) follow.
+> **Build status: stage 4 of 5.** Postgres, the ingestion CLI, Airflow and
+> the dbt star schema are in place. Stage 5 (CI + full README) follows.
 
 ## Architecture
 
@@ -43,7 +43,38 @@ requirements.txt             requests, psycopg2-binary
 airflow.Dockerfile           Airflow 3.3.2 + ingestion deps + dbt in its own venv
 dags/cairo_air_quality.py    the DAG
 scripts/gen_secrets.sh       fills the blank secrets in .env
+
+dbt/dbt_project.yml          dbt config; everything lands in `analytics`
+dbt/profiles.yml             connection, entirely from env vars
+dbt/models/staging/          stg_hourly_readings (view)
+dbt/models/marts/            dim_date, dim_pollutant, fct_hourly_readings
+dbt/tests/generic/           custom accepted_range test (no dbt_utils)
+dbt/tests/                   freshness + per-pollutant bounds
+scripts/dbt.sh               run dbt in the Airflow container
+scripts/dbt_docs.sh          build and serve the lineage graph
 ```
+
+## The star schema
+
+```
+stg_hourly_readings (view)
+        |
+        +--> dim_date              one row per CAIRO calendar day
+        +--> dim_pollutant         four rows, from staging.pollutants
+        +--> fct_hourly_readings   one row per location/pollutant/hour
+                                   incremental on the loader's watermark
+```
+
+```bash
+./scripts/dbt.sh build        # run + test
+./scripts/dbt.sh run --full-refresh
+./scripts/dbt_docs.sh         # then open http://localhost:8081
+```
+
+**44 checks pass**: 4 models plus 40 data tests — `not_null` and `unique` on
+every key, `relationships` from fact to both dimensions, `accepted_range` on
+concentration and hour-of-day, `accepted_values` on units and weekday, a
+per-pollutant plausibility test, and a 48-hour freshness test.
 
 ## Airflow
 
@@ -242,3 +273,65 @@ want them.
 **Secrets are generated, never committed.** `scripts/gen_secrets.sh` fills the
 blank values in `.env` and refuses to overwrite an existing Fernet key —
 rotating it would make every already-encrypted Airflow connection unreadable.
+
+**Why incremental rather than full refresh.** A rebuild of `fct_hourly_readings`
+is cheap *today* — a few thousand rows — and that is exactly why the decision
+has to be made on something other than current cost. What makes a rebuild
+expensive is not row count but retention: this table grows by 96 rows a day and
+nothing deletes from it, so a full refresh is work that scales with the age of
+the project rather than the size of the change. A year of four pollutants at one
+location is ~35k rows; a second city doubles it, and an hourly-to-15-minute
+change quadruples it. Incremental keeps the nightly cost proportional to one
+day of data, permanently. The escape hatch is `dbt run --full-refresh` whenever
+the model logic changes.
+
+**The incremental filter is on `loaded_at`, not `measured_at_utc`.** This is the
+part that is easy to get wrong. Filtering on measurement time looks natural and
+silently misses any value the API *revised* for an hour already held. The
+loader only moves `loaded_at` when a value actually changes — its upsert carries
+an `IS DISTINCT FROM` guard — so filtering on it picks up exactly the new and
+corrected rows. Verified end to end: tampering with one historical reading
+produced `changed=1` from the loader, and dbt propagated that single row.
+
+**`>=` not `>` on the watermark.** Rows written in one transaction share a
+timestamp. Re-processing a handful is free because `delete+insert` on the unique
+key is idempotent; missing one would not be.
+
+**`dim_date` is generated from the data, not a hardcoded 2000–2050 span.** A
+dimension full of dates the fact table has never heard of makes "days with no
+data" unanswerable, because an empty day and a missing day stop being
+distinguishable.
+
+**Egypt's weekend is Friday and Saturday.** `is_weekend` uses ISO days 5 and 6.
+The western default would put the weekly traffic-pollution trough on the wrong
+days and invert any weekday/weekend comparison.
+
+**`dim_date` is keyed on the Cairo calendar day, not the UTC one.** "What was
+PM2.5 on Tuesday" means Tuesday in Cairo, and at +2/+3 the two calendars
+disagree for two or three hours of every day.
+
+**`accepted_range` is a local generic test, not `dbt_utils`.** Fifteen lines of
+Jinja instead of a package dependency, which keeps `docker compose up` the only
+setup step.
+
+**Two range tests, deliberately.** The generic one catches values absurd for
+*any* pollutant (0–10000). A separate singular test joins `dim_pollutant` and
+catches values implausible for a *specific* one. Proven to discriminate: an
+injected PM2.5 reading of 1500 µg/m³ failed the per-pollutant test and correctly
+passed the coarse one.
+
+**Two freshness checks, measuring different things.** `dbt source freshness`
+measures ingestion lag — how long since the loader wrote anything. The singular
+test measures data recency — how old the newest measurement is. A pipeline
+running perfectly against an API serving stale data passes the first and fails
+the second. The threshold is 48 hours, not 24, because the DAG is daily and one
+missed run is noise; two is a problem.
+
+**`dbt run` and `dbt test` are separate Airflow tasks, not `dbt build`.** build
+is better at stopping bad data reaching downstream models, but with four models
+and no downstream consumers the clearer signal wins: the graph distinguishes
+"the models would not build" from "the models built and the data is wrong".
+
+**dbt tasks retry once, not four times.** A failing test is deterministic — the
+same bad row fails the same way four times over half an hour, and all that buys
+is a later alert. One retry covers the genuinely transient case.

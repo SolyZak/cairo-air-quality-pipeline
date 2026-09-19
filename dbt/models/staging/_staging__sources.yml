@@ -1,0 +1,38 @@
+version: 2
+
+sources:
+  - name: staging
+    description: >
+      Tables written by the Python loader. dbt reads them and never writes to
+      them -- the boundary between "ingestion owns this" and "dbt owns this"
+      is the schema name.
+    database: airquality
+    schema: staging
+
+    tables:
+      - name: hourly_readings
+        description: One row per location, pollutant and hour. Natural-key primary key.
+        # `dbt source freshness` measures INGESTION LAG -- how long since the
+        # loader last wrote anything. That is a different question from the
+        # freshness test in tests/assert_readings_are_fresh.sql, which measures
+        # DATA RECENCY -- how old the newest measurement is. A stuck pipeline
+        # trips the first; an API silently serving stale data trips the second.
+        loaded_at_field: loaded_at
+        freshness:
+          warn_after: {count: 26, period: hour}
+          error_after: {count: 48, period: hour}
+        columns:
+          - name: location_code
+            tests: [not_null]
+          - name: pollutant_code
+            tests: [not_null]
+          - name: measured_at_utc
+            tests: [not_null]
+
+      - name: pollutants
+        description: Reference domain for the pollutants we ingest. Source of dim_pollutant.
+        columns:
+          - name: pollutant_code
+            tests: [not_null, unique]
+          - name: plausible_max
+            tests: [not_null]

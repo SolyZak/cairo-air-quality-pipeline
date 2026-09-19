@@ -7,12 +7,25 @@ Airflow orientation, since this is the first DAG in the project:
     call it and WHAT date window to ask for. Keeping the work outside the DAG is
     what lets you run the exact same code from the CLI with no scheduler.
 
-  * Every scheduled run covers a DATA INTERVAL, not "now". A daily DAG run for
-    2026-09-18 has data_interval_start = 2026-09-18T00:00 and
-    data_interval_end = 2026-09-19T00:00. Deriving the window from the interval
-    -- rather than from today's date -- is the single thing that makes backfill
-    work: a run for a date last month pulls last month's data, not this
-    morning's.
+  * Every scheduled run carries a LOGICAL DATE and a DATA INTERVAL that belong
+    to the RUN, not to the wall clock. Deriving the window from them -- rather
+    than from today's date -- is the single thing that makes backfill work: a
+    run for a date last month pulls last month's data, not this morning's.
+
+    Careful here, because the semantics changed. In Airflow 2 a daily cron run
+    covered a span: [2026-09-18T03:00, 2026-09-19T03:00). In Airflow 3 a
+    NON-PARTITIONED dag like this one gets a ZERO-WIDTH interval instead --
+    logical_date, data_interval_start and data_interval_end are all the same
+    instant, the moment the cron fired. Confirmed against the metadata
+    database rather than assumed:
+
+        run_id                                run_after    interval_start/end
+        scheduled__2026-09-19T03:00:00+00:00  09-19 03:00  09-19 03:00 (both)
+
+    So data_interval_end.date() is simply the run's own date. That is all this
+    DAG needs, and it behaves identically under either model -- but the older
+    "end is the exclusive upper bound of a day-long span" mental model is
+    wrong here, and would mislead anyone extending this file.
 
   * `catchup=False` means turning the DAG on does not immediately schedule every
     missed day since start_date. Backfills are run deliberately instead, with
@@ -117,9 +130,9 @@ def cairo_air_quality_daily():
         context = get_current_context()
         settings = Settings.from_env()
 
-        # data_interval_end is the exclusive upper bound of the run's interval,
-        # so for the run covering 2026-09-18 it is 2026-09-19T00:00. Taking its
-        # date gives the last day we ask the API for.
+        # data_interval_end is this run's own timestamp (see the module
+        # docstring: the interval is zero-width for a non-partitioned dag in
+        # Airflow 3), so its date is the last day we ask the API for.
         #
         # The final day of the window is usually incomplete -- the 03:00 run
         # asks for today and gets three hours of it. That is intentional: the

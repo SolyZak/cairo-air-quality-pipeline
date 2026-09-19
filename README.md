@@ -183,6 +183,13 @@ That is what makes backfill correct: a run for a date last month pulls last
 month's data. Using `date.today()` would make every backfill run fetch this
 morning.
 
+Worth knowing if you are coming from Airflow 2: the interval semantics changed.
+A daily cron run used to cover a span, `[18th 03:00, 19th 03:00)`. In Airflow 3
+a non-partitioned DAG gets a **zero-width** interval — `logical_date`,
+`data_interval_start` and `data_interval_end` are all the same instant. Checked
+against the metadata database rather than assumed. This DAG works identically
+under either model, but the old mental model would mislead anyone extending it.
+
 ### Transformation
 
 `stg_hourly_readings` is a thin view — renames, and Cairo local time derived

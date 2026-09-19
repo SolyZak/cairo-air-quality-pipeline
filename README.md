@@ -2,8 +2,8 @@
 
 Daily pipeline: Open-Meteo Air Quality API -> Postgres -> dbt star schema, orchestrated by Airflow, all in Docker Compose.
 
-> **Build status: stage 2 of 5.** Postgres, schema DDL and the ingestion
-> CLI are in place. Stages 3-5 (Airflow, dbt, CI + full README) follow.
+> **Build status: stage 3 of 5.** Postgres, the ingestion CLI and Airflow
+> are in place. Stages 4-5 (dbt, CI + full README) follow.
 
 ## Architecture
 
@@ -39,7 +39,41 @@ ingestion/pipeline.py        fetch -> raw -> staging, chunked by date window
 ingestion/__main__.py        the CLI
 Dockerfile                   python:3.12-slim runner for the CLI
 requirements.txt             requests, psycopg2-binary
+
+airflow.Dockerfile           Airflow 3.3.2 + ingestion deps + dbt in its own venv
+dags/cairo_air_quality.py    the DAG
+scripts/gen_secrets.sh       fills the blank secrets in .env
 ```
+
+## Airflow
+
+```bash
+cp .env.example .env
+./scripts/gen_secrets.sh      # generates Fernet key, JWT secret, admin password
+docker compose up -d
+```
+
+Then open **http://localhost:8080** and log in with the credentials
+`gen_secrets.sh` printed.
+
+Services: `postgres`, `airflow-apiserver`, `airflow-scheduler`,
+`airflow-dag-processor`, `airflow-triggerer`, plus a one-shot `airflow-init`.
+There is no Celery worker, Redis or Flower — `LocalExecutor` runs tasks as
+subprocesses of the scheduler, which is three fewer services than the official
+Airflow compose file for a pipeline that never needs to distribute work.
+
+### Backfilling a date range
+
+```bash
+docker compose exec airflow-scheduler \
+  airflow backfill create --dag-id cairo_air_quality_daily \
+  --from-date 2026-09-10 --to-date 2026-09-13
+```
+
+⚠️ **`--to-date` is parsed as midnight.** The DAG runs at 03:00, so a run whose
+logical date is `2026-09-12T03:00` falls *outside* `--to-date 2026-09-12`. To
+include the 12th, pass `--to-date 2026-09-13`. Verified the hard way: the first
+backfill silently produced one run fewer than expected.
 
 ## Ingest some data
 
@@ -165,3 +199,46 @@ row: slow to insert, awkward to inspect, and all-or-nothing on failure.
 **Airflow imports `run_window()`; it does not shell out.** The `ingest`
 service stays as the manual entry point, but stage 3's DAG calls the same
 Python function directly — so there is one code path, not two that can drift.
+
+**The DAG holds no business logic.** It decides *when* to run and *what date
+window* to ask for; the work lives in the `ingestion` package. That is what
+lets the identical code path run from the CLI with no scheduler involved —
+`docker compose run --rm ingest` and the Airflow task call the same
+`run_window()`.
+
+**The window comes from the run's data interval, not from today's date.** For a
+`0 3 * * *` schedule, `data_interval_end.date()` is the run's logical date, and
+the window is that day plus the six before it. This is the single thing that
+makes backfill correct: a run for a date last month pulls last month's data.
+Using `date.today()` instead would make every backfill run fetch this morning.
+
+**Manual runs have no data interval.** In Airflow 3, only scheduled runs and
+backfills get one, so `context["data_interval_end"]` raises `KeyError` when you
+press Trigger in the UI. The task falls back to the current UTC date, which is
+the obvious meaning of "run it now". Found by triggering a run, not by reading
+docs.
+
+**Retries back off exponentially.** `retries=4`, `retry_delay=2min`,
+`retry_exponential_backoff=True`, capped at 30 minutes — so roughly 2, 4, 8, 16
+minutes. The HTTP client already retries seconds apart for blips; anything
+surviving that is an outage, and outages need time rather than repetition. A
+fixed 2-minute retry would burn all four attempts inside eight minutes.
+
+**`max_active_runs=1`.** Two concurrent runs would upsert overlapping windows
+into the same primary-key range. Correct, thanks to `ON CONFLICT`, but a
+reliable source of lock contention for no benefit — and it keeps a backfill
+sequential and readable.
+
+**dbt lives in its own virtualenv inside the Airflow image.** Airflow and dbt
+both pin Jinja2, historically to incompatible versions. `/opt/dbt-venv` means
+the two dependency trees never meet; the DAG will call dbt as a subprocess.
+About 15 lines to avoid a well-known dependency conflict.
+
+**Airflow logs go to a named volume, not a bind mount.** Bind-mounting logs
+means fighting host/container UID mismatches (the `AIRFLOW_UID` dance in the
+official compose file). The logs are readable in the UI, which is where you
+want them.
+
+**Secrets are generated, never committed.** `scripts/gen_secrets.sh` fills the
+blank values in `.env` and refuses to overwrite an existing Fernet key —
+rotating it would make every already-encrypted Airflow connection unreadable.

@@ -1,16 +1,79 @@
 # ---------------------------------------------------------------------------
-# Stage 1: Postgres only.
-# Airflow services are added in stage 3, dbt runs inside the Airflow image.
+# Everything comes up with:  docker compose up -d
 #
-#   docker compose up -d
+#   postgres              the warehouse + Airflow's metadata database
+#   airflow-init          one-shot: db migrate + create the admin user
+#   airflow-apiserver     the web UI, http://localhost:8080
+#   airflow-scheduler     decides what to run and runs it (LocalExecutor)
+#   airflow-dag-processor parses dags/ into the metadata database
+#   airflow-triggerer     runs deferred/async tasks
+#   ingest                one-shot CLI, behind a profile (see below)
 #
-# The `version:` key is deliberately absent -- it has been obsolete since
-# Compose v2 and current versions warn about it.
+# LocalExecutor runs tasks as subprocesses of the scheduler. That is why there
+# is no Celery worker, no Redis and no Flower here, unlike the official Airflow
+# compose file -- three fewer services for a single-machine pipeline that never
+# needs to distribute work.
+#
+# The `version:` key is deliberately absent; it has been obsolete since
+# Compose v2.
 # ---------------------------------------------------------------------------
 
 # Pin the Compose project name. Without this it defaults to the directory name,
 # so renaming or moving the checkout would orphan the pgdata volume.
 name: cairo-air-quality
+
+# Shared by all four Airflow services. YAML anchors keep this in one place --
+# a setting that differs between the scheduler and the API server is almost
+# always a bug.
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: airflow.Dockerfile
+  image: cairo-air-quality/airflow:local
+  env_file: .env
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${AIRFLOW_DB}
+
+    # Encrypts connection passwords and variables at rest in the metadata DB.
+    # Changing it makes existing encrypted values unreadable.
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    # Signs the tokens tasks use to call back into the API server.
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+    # In Airflow 3 a running task talks to the API server rather than reaching
+    # into the metadata database directly, so it needs to know where that is.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # Unpaused on creation so the pipeline demonstrates itself on first boot.
+    # Set to 'true' if you would rather start it by hand from the UI.
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+
+    # The DAG does `from ingestion.pipeline import run_window`, so the package
+    # has to be importable. /opt/airflow is on the path by default in the image;
+    # this is explicit so the reason is visible.
+    PYTHONPATH: /opt/airflow
+
+    # The ingestion code reads its settings from the environment (the rest come
+    # from env_file above). Inside the compose network the database is reachable
+    # by service name, whatever .env says for host-side use.
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
+  volumes:
+    # Read-only: Airflow has no business writing to your source tree.
+    - ./dags:/opt/airflow/dags:ro
+    - ./ingestion:/opt/airflow/ingestion:ro
+    - ./dbt:/opt/airflow/dbt:ro
+    # A named volume rather than a bind mount. Bind-mounting logs means fighting
+    # host/container UID mismatches (the AIRFLOW_UID dance in the official
+    # compose file); the logs are readable in the UI, which is where you want
+    # them anyway.
+    - airflow-logs:/opt/airflow/logs
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
 
 services:
   postgres:
@@ -35,12 +98,95 @@ services:
       # to a running database is what scripts/apply_ddl.sh is for.
       - ./sql:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      # Airflow's services will wait on this in stage 3.
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 10
       start_period: 10s
+
+  # One-shot. Runs the metadata schema migration and creates the admin user,
+  # then exits. Every other Airflow service waits for it to finish successfully,
+  # which is what stops the scheduler racing an unmigrated database on a cold
+  # start. Safe to re-run: `airflow db migrate` is idempotent.
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow users create \
+          --username "$${AIRFLOW_ADMIN_USERNAME}" \
+          --password "$${AIRFLOW_ADMIN_PASSWORD}" \
+          --firstname Air --lastname Quality \
+          --role Admin --email admin@example.com \
+          || echo "admin user already exists, continuing"
+    restart: "no"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "${AIRFLOW_WEB_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Separate process in Airflow 3: parsing user DAG code is isolated from the
+  # scheduler, so a syntax error in dags/ cannot take scheduling down with it.
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
 
   # Standalone ingestion runner. `profiles:` keeps it OUT of `docker compose up`
   # -- it is a one-shot command, not a long-running service, so starting it
@@ -51,8 +197,8 @@ services:
   #   docker compose run --rm ingest --start 2026-08-01 --end 2026-08-31
   #   docker compose run --rm ingest --dry-run
   #
-  # In stage 3 Airflow calls the same code by importing it, not by running this
-  # container -- this service stays as the manual/debug entry point.
+  # Airflow calls the same code by importing it, not by running this container
+  # -- this service is the manual/debug entry point.
   ingest:
     build:
       context: .
@@ -61,17 +207,14 @@ services:
     profiles: ["tools"]
     env_file: .env
     environment:
-      # Inside the compose network the database is reachable by service name,
-      # whatever POSTGRES_HOST says in .env for host-side use.
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
-      # Bind-mounted so editing the package takes effect on the next run
-      # without rebuilding the image.
       - ./ingestion:/opt/pipeline/ingestion:ro
 
 volumes:
   pgdata:
+  airflow-logs:

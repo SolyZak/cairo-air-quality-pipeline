@@ -1,0 +1,95 @@
+# Runs the dbt models and their tests against a throwaway Postgres on every
+# push and pull request.
+#
+# What this does NOT do is call the Open-Meteo API. A build that goes red
+# because someone else's service is down teaches you nothing and trains you to
+# ignore failures; CI seeds a deterministic fixture instead (ci/seed_test_data.sql).
+
+name: dbt tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  # Lets you re-run it by hand from the Actions tab.
+  workflow_dispatch:
+
+jobs:
+  dbt:
+    name: build models and run data tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: airquality
+          POSTGRES_PASSWORD: airquality
+          POSTGRES_DB: airquality
+        ports:
+          - 5432:5432
+        # Without a healthcheck the job races the database on a cold start.
+        options: >-
+          --health-cmd "pg_isready -U airquality -d airquality"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Read by sql/00_create_airflow_db.sh, by psql itself, and by
+      # dbt/profiles.yml -- one set of variables for all three, exactly as in
+      # docker compose. These are throwaway CI credentials for a database that
+      # is destroyed when the job ends.
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: airquality
+      PGPASSWORD: airquality
+      PGDATABASE: airquality
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: airquality
+      POSTGRES_PASSWORD: airquality
+      POSTGRES_DB: airquality
+      AIRFLOW_DB: airflow
+      DBT_PROFILES_DIR: dbt
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dbt
+        # Pinned to the same version as airflow.Dockerfile. If CI and the image
+        # drift, CI stops being evidence about what actually runs.
+        run: pip install --no-cache-dir "dbt-postgres==1.11.0"
+
+      - name: Apply schema DDL
+        # The same files Postgres runs on first boot in docker compose, in the
+        # same order -- so CI exercises the real DDL rather than a copy that
+        # can quietly fall behind it.
+        run: |
+          set -euo pipefail
+          for f in sql/*; do
+            echo "--> $f"
+            case "$f" in
+              *.sh)  bash "$f" ;;
+              *.sql) psql -v ON_ERROR_STOP=1 --quiet -f "$f" ;;
+            esac
+          done
+
+      - name: Seed fixture
+        run: psql -v ON_ERROR_STOP=1 --quiet -f ci/seed_test_data.sql
+
+      - name: dbt build
+        # `build` runs models and their tests together in dependency order, so
+        # a broken model fails before its tests run against a stale table.
+        run: dbt build --project-dir dbt
+
+      - name: dbt source freshness
+        # Separate from `build` because this one checks ingestion lag rather
+        # than the data itself, and it is the check most likely to be
+        # legitimately noisy. Reported, never fatal.
+        run: dbt source freshness --project-dir dbt
+        continue-on-error: true

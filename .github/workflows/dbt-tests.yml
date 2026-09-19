@@ -1,11 +1,19 @@
-# Runs the dbt models and their tests against a throwaway Postgres on every
-# push and pull request.
+# Two jobs, run in parallel on every push and pull request:
+#
+#   unit-tests  pure-Python tests of the ingestion package. No database, no
+#               network, so they finish in seconds and can never be flaky.
+#   dbt         builds the models against a throwaway Postgres and runs the
+#               data tests against them.
+#
+# They are separate jobs rather than steps in one because they fail for
+# unrelated reasons and only one of them needs a database. A broken parser and
+# a broken model should not be reported as the same red X.
 #
 # What this does NOT do is call the Open-Meteo API. A build that goes red
 # because someone else's service is down teaches you nothing and trains you to
 # ignore failures; CI seeds a deterministic fixture instead (ci/seed_test_data.sql).
 
-name: dbt tests
+name: tests
 
 on:
   push:
@@ -15,6 +23,23 @@ on:
   workflow_dispatch:
 
 jobs:
+  unit-tests:
+    name: unit tests (ingestion package)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install --no-cache-dir -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest
+
   dbt:
     name: build models and run data tests
     runs-on: ubuntu-latest

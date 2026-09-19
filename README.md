@@ -1,6 +1,7 @@
 # Cairo Air Quality Pipeline
 
-[![dbt tests](https://github.com/SolyZak/cairo-air-quality-pipeline/actions/workflows/dbt-tests.yml/badge.svg)](https://github.com/SolyZak/cairo-air-quality-pipeline/actions/workflows/dbt-tests.yml)
+[![tests](https://github.com/SolyZak/cairo-air-quality-pipeline/actions/workflows/dbt-tests.yml/badge.svg)](https://github.com/SolyZak/cairo-air-quality-pipeline/actions/workflows/dbt-tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A daily pipeline that ingests hourly air quality readings for Cairo from the
 [Open-Meteo Air Quality API](https://open-meteo.com/en/docs/air-quality-api),
@@ -118,9 +119,19 @@ dbt/models/marts/            dim_date, dim_pollutant, fct_hourly_readings
 dbt/tests/generic/           accepted_range, written locally (no dbt_utils)
 dbt/tests/                   freshness, per-pollutant plausibility
 
+tests/                       54 unit tests: parser guards, config, chunking
+pytest.ini                   test config
+requirements-dev.txt         pytest; runtime images never install it
+
 ci/seed_test_data.sql        deterministic fixture; CI never calls the API
-.github/workflows/           dbt tests on every push
+.github/workflows/           unit tests + dbt tests on every push
 scripts/                     gen_secrets, apply_ddl, psql, dbt, dbt_docs
+```
+
+Run the unit tests locally:
+
+```bash
+pip install -r requirements-dev.txt && python -m pytest
 ```
 
 ---
@@ -242,7 +253,26 @@ loader out of 96 submitted, and dbt propagated exactly that row.
 
 ## Data quality
 
-**44 checks**, run by `dbt build` locally and by CI on every push.
+**98 automated checks** on every push: 54 Python unit tests and 44 dbt checks,
+as two parallel CI jobs. They are separate jobs because they fail for unrelated
+reasons and only one of them needs a database — a broken parser and a broken
+model should not be reported as the same red X.
+
+### Unit tests (54)
+
+Pure functions only: no database, no network, so they run in under a tenth of a
+second and cannot be flaky. They cover the four upstream guards, the unit
+aliasing (including that GREEK SMALL LETTER MU and MICRO SIGN are genuinely
+different characters), the forecast boundary, null preservation,
+value-to-timestamp alignment, settings validation, and date-window chunking —
+where a property test asserts the windows are contiguous, cover the range
+exactly, and never duplicate or skip a date, across six chunk sizes.
+
+The suite was **mutation-tested** rather than assumed to work. Changing the
+forecast filter from `>` to `>=` failed exactly the boundary test; making
+`normalise_unit` coerce unknown units instead of rejecting them failed four.
+
+### dbt checks (44)
 
 | Layer | Enforces |
 |---|---|
@@ -398,6 +428,10 @@ Things I left out deliberately, and what I would do instead in production:
 - **Single location, hardcoded to Cairo.** The grain already carries
   `location_code`, so adding cities is a config change rather than a schema
   change, but there is no `dim_location` yet.
+- **No integration test of the loader.** The parser is unit-tested and the SQL
+  is tested through dbt, but `insert_raw_response` and `upsert_readings` are
+  only exercised by running the thing. Testcontainers, or a Postgres service in
+  the unit-test job, would close that gap.
 - **No alerting.** A failed DAG shows red in the UI and nothing else. Real
   operation needs the failure to reach a human.
 - **No BI layer.** `analytics.*` is query-ready but there is no dashboard;

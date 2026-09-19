@@ -1,0 +1,5 @@
+# Development-only dependencies. Deliberately separate from requirements.txt so
+# the runtime images stay minimal -- neither the ingestion container nor the
+# Airflow image installs pytest.
+-r requirements.txt
+pytest>=8,<9

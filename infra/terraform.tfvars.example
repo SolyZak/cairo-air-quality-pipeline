@@ -1,0 +1,16 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+#
+#   cp infra/terraform.tfvars.example infra/terraform.tfvars
+
+# Where budget alarms are sent.
+budget_alert_email = "you@example.com"
+
+# Your public IP as a /32. Find it with:
+#   curl -s https://checkip.amazonaws.com
+# This is the ONLY address that can reach SSH and the Airflow UI.
+# Re-run terraform apply if your home IP changes.
+admin_cidr = "203.0.113.4/32"
+
+# Optional overrides:
+# region             = "us-east-1"
+# monthly_budget_usd = 25

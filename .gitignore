@@ -26,3 +26,11 @@ standalone_admin_password.txt
 .vscode/
 
 .pytest_cache/
+
+# Terraform
+infra/.terraform/
+infra/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+crash.log
